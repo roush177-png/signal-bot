@@ -7,7 +7,6 @@ import os
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-)
 
 # Логирование в stdout — Render покажет это в логах
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
