@@ -185,6 +185,22 @@ def fetch_last_closed_d1(symbol_bot: str):
         "close": float(cl), "volume": float(vol)
     }
 
+def fetch_last_closed_h4(symbol_bot: str):
+    market = CCXT_SYMBOLS.get(symbol_bot)
+    if not market:
+        raise ValueError(f"Неизвестный символ {symbol_bot}")
+    ohlcv = exchange.fetch_ohlcv(market, timeframe="4h", limit=3)
+    if not ohlcv or len(ohlcv) < 2:
+        raise RuntimeError("Недостаточно данных H4")
+    ts, op, hi, lo, cl, vol = ohlcv[-2]  # предыдущая закрытая H4
+    t_open = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).astimezone(TZ)
+    t_close = t_open + timedelta(hours=4)
+    return {
+        "t_open": t_open, "t_close": t_close,
+        "open": float(op), "high": float(hi), "low": float(lo),
+        "close": float(cl), "volume": float(vol)
+    }
+
 def fetch_last_closed_lower_tf_candle(symbol_bot: str, tf: str = REALTIME_TF):
     market = CCXT_SYMBOLS.get(symbol_bot)
     if not market:
@@ -202,11 +218,11 @@ def fetch_last_closed_lower_tf_candle(symbol_bot: str, tf: str = REALTIME_TF):
         "close": float(cl), "volume": float(vol),
     }
 
-def fmt_candle_report(symbol: str, c: dict) -> str:
+def fmt_candle_report(symbol: str, c: dict, tf: str = "1h") -> str:
     return (
         f"Актив: {symbol}\n"
         f"Время: {c['t_open'].strftime('%d.%m.%Y г. %H:00')}-{c['t_close'].strftime('%H:00')}\n"
-        f"Свеча: H1\n"
+        f"Свеча: {tf.upper()}\n"
         f"Цена открытия: {c['open']:.6f}\n"
         f"Цена закрытия: {c['close']:.6f}\n"
         f"Характер свечи: {'Зелёная' if c['close']>=c['open'] else 'Красная'}\n"
@@ -364,16 +380,21 @@ def risk_line_for(direction: str, btc_dir: str):
 
 # -------------------- PDH/PDL + РЕЖИМ --------------------
 
-def get_prev_day_levels(symbol: str):
-    """Возвращает (PDO, PDH, PDL, PDC) по предыдущему дню (D1)."""
-    d = fetch_last_closed_d1(symbol)
+def get_prev_levels(symbol: str, level_tf: str = "1d"):
+    """Возвращает (PO, PH, PL, PC) по предыдущему периоду в зависимости от level_tf."""
+    if level_tf == "1d":
+        d = fetch_last_closed_d1(symbol)
+    elif level_tf == "4h":
+        d = fetch_last_closed_h4(symbol)
+    else:
+        raise ValueError(f"Неизвестный level_tf: {level_tf}")
     return d["open"], d["high"], d["low"], d["close"]
 
-def detect_regime(symbol: str, last_c: dict, pdl: float, pdh: float, rvol: float):
+def detect_regime(symbol: str, last_c: dict, levels_low: float, levels_high: float, rvol: float):
     lo = last_c["low"]; hi = last_c["high"]; cl = last_c["close"]
-    if (lo < pdl - EPS_LEVEL) and (cl > pdl) and (rvol >= RVOL_SWEEP_MIN):
+    if (lo < levels_low - EPS_LEVEL) and (cl > levels_low) and (rvol >= RVOL_SWEEP_MIN):
         return "SWEEP_LONG"
-    if (hi > pdh + EPS_LEVEL) and (cl < pdh) and (rvol >= RVOL_SWEEP_MIN):
+    if (hi > levels_high + EPS_LEVEL) and (cl < levels_high) and (rvol >= RVOL_SWEEP_MIN):
         return "SWEEP_SHORT"
     # тренд по EMA20(H1)
     try:
@@ -424,9 +445,12 @@ def session_hilo(symbol: str, date_dt: datetime, sess_name: str):
 
 # -------------------- АВТОМАТИЧЕСКИЕ СИГНАЛЫ --------------------
 
-def generate_signal(symbol: str, candle: dict, tf: str = "1h"):
+def generate_signal(symbol: str, candle: dict, levels: dict, level_tf: str, tf: str = "1h"):
     try:
-        pdo, pdh, pdl, pdc = get_prev_day_levels(symbol)
+        pdo = levels["open"]
+        pdh = levels["high"]
+        pdl = levels["low"]
+        pdc = levels["close"]
         cs = fetch_last_n_h1_candles(symbol, max(ATR_PERIOD+2, 30))
         a = atr_from_candles(cs, n=ATR_PERIOD) or 0.0
         rvol_ratio, rvol_tag = volume_anomaly(symbol, window=VOL_WINDOW, last_candle=candle)
@@ -479,21 +503,6 @@ def generate_signal(symbol: str, candle: dict, tf: str = "1h"):
 
     if direction is None:
         return None
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "confirm_thr": confirm_thr,
-        "regime": regime,
-        "atr": a,
-        "rvol_ratio": rvol_ratio,
-        "rvol_tag": rvol_tag,
-        "tf": tf,
-    }
-    if not direction:
-        return None
 
     # FVG check
     if FVG_REQUIRED:
@@ -516,6 +525,7 @@ def generate_signal(symbol: str, candle: dict, tf: str = "1h"):
         "atr": a,
         "rvol_ratio": rvol_ratio,
         "rvol_tag": rvol_tag,
+        "level_tf": level_tf,
         "tp_progress": {"TP1": False, "TP2": False, "TP3": False, "BE": False},
         "early_confirmed": False if tf != "1h" else True
     }
@@ -552,7 +562,11 @@ async def hourly_pulse_job(context: ContextTypes.DEFAULT_TYPE):
     for sym in symbols:
         try:
             candles[sym] = fetch_last_closed_h1_candle(sym)
-            signals[sym] = generate_signal(sym, candles[sym])
+            for level_tf in ["1d", "4h"]:
+                o, h, l, c = get_prev_levels(sym, level_tf)
+                levels = {"open": o, "high": h, "low": l, "close": c}
+                signal_key = f"{sym}_{level_tf}"
+                signals[signal_key] = generate_signal(sym, candles[sym], levels, level_tf)
         except Exception as e:
             log(f"pulse ERR {sym}: {e}")
 
@@ -570,23 +584,25 @@ async def hourly_pulse_job(context: ContextTypes.DEFAULT_TYPE):
             parts.append("📊 Отчёт по закрытой H1:\n\n" + fmt_candle_report(sym, c))
             reports_done.add(sym)
 
-        signal = signals.get(sym)
-        if not signal: continue
+        for level_tf in ["1d", "4h"]:
+            signal_key = f"{sym}_{level_tf}"
+            signal = signals.get(signal_key)
+            if not signal: continue
 
-        direction = signal["direction"]
-        ok, label, reason = check_confirmation(direction, signal, c["close"])
+            direction = signal["direction"]
+            ok, label, reason = check_confirmation(direction, signal, c["close"])
 
-        if ok:
-            line = f"\n⚡️ {sym} [{direction.upper()}]: {label} — {reason}\n"
-            line += f"entry={signal['entry']:.6f} SL={signal['SL']:.6f} TP={','.join(f'{t:.6f}' for t in signal['TP'])}\n"
-            line += risk_line_for(direction, btc_dir_str) + "\n"
-            line += f"VOL: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
-            line += f"context: regime={signal['regime']} ATR={signal['atr']:.4f}\n"
-            parts.append(line)
+            if ok:
+                line = f"\n⚡️ {sym} [{direction.upper()}] ({level_tf.upper()} levels): {label} — {reason}\n"
+                line += f"entry={signal['entry']:.6f} SL={signal['SL']:.6f} TP={','.join(f'{t:.6f}' for t in signal['TP'])}\n"
+                line += risk_line_for(direction, btc_dir_str) + "\n"
+                line += f"VOL: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
+                line += f"context: regime={signal['regime']} ATR={signal['atr']:.4f}\n"
+                parts.append(line)
 
-        msgs, changed = check_tp_hits_and_messages(sym, direction, signal, c)
-        if msgs: parts.extend(msgs)
-        if changed: changed_any = True
+            msgs, changed = check_tp_hits_and_messages(sym, direction, signal, c)
+            if msgs: parts.extend(msgs)
+            if changed: changed_any = True
 
     if parts:
         text = "\n".join(parts)
@@ -618,7 +634,11 @@ async def realtime_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     for sym in symbols:
         try:
             lower_candles[sym] = fetch_last_closed_lower_tf_candle(sym, REALTIME_TF)
-            signals[sym] = generate_signal(sym, lower_candles[sym], tf=REALTIME_TF)
+            for level_tf in ["1d", "4h"]:
+                o, h, l, c = get_prev_levels(sym, level_tf)
+                levels = {"open": o, "high": h, "low": l, "close": c}
+                signal_key = f"{sym}_{level_tf}"
+                signals[signal_key] = generate_signal(sym, lower_candles[sym], levels, level_tf, tf=REALTIME_TF)
         except Exception as e:
             log(f"realtime ERR {sym} {REALTIME_TF}: {e}")
 
@@ -629,20 +649,22 @@ async def realtime_monitor_job(context: ContextTypes.DEFAULT_TYPE):
         c = lower_candles.get(sym)
         if not c: continue
 
-        signal = signals.get(sym)
-        if not signal or signal.get("early_confirmed", False): continue
+        for level_tf in ["1d", "4h"]:
+            signal_key = f"{sym}_{level_tf}"
+            signal = signals.get(signal_key)
+            if not signal or signal.get("early_confirmed", False): continue
 
-        direction = signal["direction"]
-        ok, label, reason = check_confirmation(direction, signal, c["close"])
+            direction = signal["direction"]
+            ok, label, reason = check_confirmation(direction, signal, c["close"])
 
-        if ok:
-            line = f"\n🚨 EARLY {sym} [{direction.upper()}]: {label} — {reason} (на {REALTIME_TF.upper()})\n"
-            line += f"entry={signal['entry']:.6f} SL={signal['SL']:.6f} TP={','.join(f'{t:.6f}' for t in signal['TP'])}\n"
-            line += risk_line_for(direction, btc_dir_str) + "\n"
-            line += f"VOL: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
-            line += f"context: regime={signal['regime']} ATR={signal['atr']:.4f} TF={REALTIME_TF.upper()}\n"
-            parts.append(line)
-            signal["early_confirmed"] = True  # mark as sent
+            if ok:
+                line = f"\n🚨 EARLY {sym} [{direction.upper()}] ({level_tf.upper()} levels): {label} — {reason} (на {REALTIME_TF.upper()})\n"
+                line += f"entry={signal['entry']:.6f} SL={signal['SL']:.6f} TP={','.join(f'{t:.6f}' for t in signal['TP'])}\n"
+                line += risk_line_for(direction, btc_dir_str) + "\n"
+                line += f"VOL: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
+                line += f"context: regime={signal['regime']} ATR={signal['atr']:.4f} TF={REALTIME_TF.upper()}\n"
+                parts.append(line)
+                signal["early_confirmed"] = True  # mark as sent
 
     if parts:
         text = "\n".join(parts)
@@ -727,6 +749,75 @@ async def echo_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text.strip().lower() == "ping":
         await update.message.reply_text("pong")
 
+async def cmd_prevday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ensure_chat_allowed(update): return
+    text = update.message.text or ""
+    parts = text.split()[1:]
+    params = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            params[k.strip()] = v.strip()
+    symbol = params.get("symbol")
+    if not symbol:
+        await update.message.reply_text("Использование: /prevday symbol=ADAUSDT")
+        return
+    try:
+        o, h, l, c = get_prev_levels(symbol, "1d")
+        txt = f"Previous Day (D1) for {symbol}:\n"
+        txt += f"Open: {o:.6f}\nHigh: {h:.6f}\nLow: {l:.6f}\nClose: {c:.6f}"
+        await update.message.reply_text(txt)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+
+async def cmd_sesslevels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ensure_chat_allowed(update): return
+    text = update.message.text or ""
+    parts = text.split()[1:]
+    params = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            params[k.strip()] = v.strip()
+    symbol = params.get("symbol")
+    date_str = params.get("date")
+    if not symbol or not date_str:
+        await update.message.reply_text("Использование: /sesslevels symbol=ADAUSDT date=2025-09-30")
+        return
+    try:
+        date_dt = datetime.strptime(date_str, "%Y-%m-%d")
+        txt = f"Session Levels for {symbol} on {date_str}:\n"
+        for sess in ["Asia", "Europe", "US"]:
+            hilo = session_hilo(symbol, date_dt, sess)
+            if hilo:
+                hi, lo = hilo
+                txt += f"{sess}: High {hi:.6f}, Low {lo:.6f}\n"
+            else:
+                txt += f"{sess}: No data\n"
+        await update.message.reply_text(txt)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+
+async def cmd_h4close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ensure_chat_allowed(update): return
+    text = update.message.text or ""
+    parts = text.split()[1:]
+    params = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            params[k.strip()] = v.strip()
+    symbol = params.get("symbol")
+    if not symbol:
+        await update.message.reply_text("Использование: /h4close symbol=ADAUSDT")
+        return
+    try:
+        c = fetch_last_closed_h4(symbol)
+        txt = fmt_candle_report(symbol, c, tf="4h")
+        await update.message.reply_text(txt)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+
 # -------------------- APP --------------------
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -742,6 +833,9 @@ def build_app():
     app.add_handler(CommandHandler("add_symbol", cmd_add_symbol))
     app.add_handler(CommandHandler("remove_symbol", cmd_remove_symbol))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("prevday", cmd_prevday))
+    app.add_handler(CommandHandler("sesslevels", cmd_sesslevels))
+    app.add_handler(CommandHandler("h4close", cmd_h4close))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_ping))
 
     app.add_error_handler(error_handler)
