@@ -92,7 +92,44 @@ def main():
 
     # Добавляем периодическое задание: интервал 3600 секунд (1 час)
     # first=0 — сразу выполняет при старте, можно поставить first=3600 для запуска на следующем часе
-    app.job_queue.run_repeating(hourly_job, interval=3600, first=0)
+    # В начале файла (если ещё нет) добавь:
+import threading
+import time
+# остальной импорт оставляем как есть
+
+# определение фоновой функции (можно адаптировать символы)
+def hourly_loop_daemon():
+    logger.info("Фоновый поток запущен.")
+    backoff = 1
+    while True:
+        try:
+            symbols = ["ADAUSDT", "XRPUSDT", "SOLUSDT"]  # или твой набор
+            for s in symbols:
+                text = format_candle(s)
+                send_to_telegram(text)
+            backoff = 1
+        except Exception as e:
+            logger.exception("Ошибка в фоновой задаче: %s", e)
+            try:
+                send_to_telegram(f"⚠️ Ошибка в боте: {e}")
+            except Exception:
+                logger.exception("Не удалось отправить уведомление об ошибке")
+            wait = min(backoff, 3600)
+            time.sleep(wait)
+            backoff = min(backoff * 2, 3600)
+            continue
+
+        # ждать ровно 1 час
+        time.sleep(3600)
+
+# Внутри main(), перед app.run_polling():
+    # запускаем фоновый поток как демон
+    t = threading.Thread(target=hourly_loop_daemon, daemon=True)
+    t.start()
+    logger.info("Запущен фоновый поток для hourly_loop_daemon")
+
+    logger.info("Запускаю приложение (polling).")
+    app.run_polling(stop_signals=None)
 
     logger.info("Запускаю приложение (polling).")
     app.run_polling(stop_signals=None)  # Render корректно обрабатывает стопы
