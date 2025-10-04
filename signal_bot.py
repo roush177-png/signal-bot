@@ -1,144 +1,57 @@
-# signal_bot.py — для python-telegram-bot v21.6
-import threading
-import time
+import os
 import logging
 import requests
-import os
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Логирование в stdout — Render покажет это в логах
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+# Настройка логов
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Получаем токен и чат ID из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # оставь строкой, не обязательно int
+CHAT_ID = os.getenv("CHAT_ID")
 
 if not BOT_TOKEN or not CHAT_ID:
-    logger.error("BOT_TOKEN или CHAT_ID не заданы в переменных окружения. Выход.")
-    raise SystemExit(1)
+    logger.error("❌ BOT_TOKEN или CHAT_ID не заданы в переменных окружения. Выход.")
+    exit(1)
 
-BASE_TG_SEND = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-def get_last_candle(symbol="SOLUSDT", interval="60"):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": 2
-    }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if "result" not in data or "list" not in data["result"] or len(data["result"]["list"]) < 2:
-        raise ValueError(f"Unexpected kline response for {symbol}: {data}")
-    candle = data["result"]["list"][1]
-    ts, o, h, l, c, vol, turnover = candle[:7]
-    t_open = datetime.fromtimestamp(int(ts) / 1000)
-    return {
-        "time": t_open.strftime("%d.%m.%Y %H:%M"),
-        "open": float(o),
-        "high": float(h),
-        "low": float(l),
-        "close": float(c),
-        "volume": float(vol)
-    }
-
-def format_candle(symbol):
-    c = get_last_candle(symbol)
-    color = "Зеленая" if c["close"] > c["open"] else "Красная"
-    return (f"Актив: {symbol}\n"
-            f"Время: {c['time']}\n"
-            f"Свеча: H1\n"
-            f"Цена открытия: {c['open']:.6f}\n"
-            f"Цена закрытия: {c['close']:.6f}\n"
-            f"Характер свечи: {color}\n"
-            f"Прокол вверх: {c['high']:.6f}\n"
-            f"Прокол вниз: {c['low']:.6f}\n"
-            f"Объём: {c['volume']:.2f}")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот запущен. Я буду слать отчёты по SOL и TRX каждый час.")
-
-# Фоновая задача, вызывается JobQueue
-async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
+# Проверка API (пример: Binance)
+def get_price(symbol="ADAUSDT"):
     try:
-        logger.info("Job: собираю и отправляю SOL и TRX")
-        sol = format_candle("SOLUSDT")
-        trx = format_candle("TRXUSDT")
-
-        # Отправка через context.bot
-        await context.bot.send_message(chat_id=CHAT_ID, text=sol)
-        await context.bot.send_message(chat_id=CHAT_ID, text=trx)
-        logger.info("Job: отправлено успешно")
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        return float(data["price"])
     except Exception as e:
-        logger.exception("Ошибка в hourly_job: %s", e)
-        # Попытка уведомить в телеграм (если отправка упадёт — лог будет)
-        try:
-            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Ошибка в боте: {e}")
-        except Exception:
-            logger.exception("Не удалось отправить сообщение об ошибке")
+        logger.error(f"Ошибка при получении цены {symbol}: {e}")
+        return None
+
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Бот запущен и готов работать!")
+
+# Команда /price
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbols = ["ADAUSDT", "XRPUSDT", "SOLUSDT"]
+    reply = "📊 Актуальные цены:\n"
+    for s in symbols:
+        p = get_price(s)
+        reply += f"{s}: {p}\n" if p else f"{s}: ошибка\n"
+    await update.message.reply_text(reply)
 
 def main():
+    logger.info("🚀 Запуск бота...")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команда /start
+    # Регистрируем команды
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price))
 
-    # Добавляем периодическое задание: интервал 3600 секунд (1 час)
-    # first=0 — сразу выполняет при старте, можно поставить first=3600 для запуска на следующем часе
-    # В начале файла (если ещё нет) добавь:
-import threading
-import time
-# остальной импорт оставляем как есть
-
-# Фоновая синхронная функция, будет работать в отдельном потоке
-def hourly_loop_daemon():
-    logger.info("Фоновый поток запущен.")
-    backoff = 1
-    while True:
-        try:
-            symbols = ["ADAUSDT", "XRPUSDT", "SOLUSDT"]  # нужные инструменты
-            for s in symbols:
-                text = format_candle(s)
-                send_to_telegram(text)
-            backoff = 1
-        except Exception as e:
-            logger.exception("Ошибка в фоновой задаче: %s", e)
-            try:
-                send_to_telegram(f"⚠️ Ошибка в боте: {e}")
-            except Exception:
-                logger.exception("Не удалось отправить уведомление об ошибке")
-            wait = min(backoff, 3600)
-            time.sleep(wait)
-            backoff = min(backoff * 2, 3600)
-            continue
-
-        # Ждём ровно 1 час
-        time.sleep(3600)
-
-    # запускаем фоновый поток как демон
-    t = threading.Thread(target=hourly_loop_daemon, daemon=True)
-    t.start()
-    logger.info("Запущен фоновый поток для hourly_loop_daemon")
-
-    # и затем запускаем polling
-    app.run_polling(stop_signals=None)
-
-# Внутри main(), перед app.run_polling():
-    # запускаем фоновый поток как демон
-    t = threading.Thread(target=hourly_loop_daemon, daemon=True)
-    t.start()
-    logger.info("Запущен фоновый поток для hourly_loop_daemon")
-
-    logger.info("Запускаю приложение (polling).")
-    app.run_polling(stop_signals=None)
-
-    logger.info("Запускаю приложение (polling).")
-    app.run_polling(stop_signals=None)  # Render корректно обрабатывает стопы
+    # Запуск бота
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
-
