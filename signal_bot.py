@@ -1,14 +1,12 @@
 # signal_bot.py — для python-telegram-bot v21.6
-import os
+import threading
+import time
 import logging
 import requests
+import os
 from datetime import datetime
-
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 )
 
 # Логирование в stdout — Render покажет это в логах
@@ -97,13 +95,13 @@ import threading
 import time
 # остальной импорт оставляем как есть
 
-# определение фоновой функции (можно адаптировать символы)
+# Фоновая синхронная функция, будет работать в отдельном потоке
 def hourly_loop_daemon():
     logger.info("Фоновый поток запущен.")
     backoff = 1
     while True:
         try:
-            symbols = ["ADAUSDT", "XRPUSDT", "SOLUSDT"]  # или твой набор
+            symbols = ["ADAUSDT", "XRPUSDT", "SOLUSDT"]  # нужные инструменты
             for s in symbols:
                 text = format_candle(s)
                 send_to_telegram(text)
@@ -119,8 +117,16 @@ def hourly_loop_daemon():
             backoff = min(backoff * 2, 3600)
             continue
 
-        # ждать ровно 1 час
+        # Ждём ровно 1 час
         time.sleep(3600)
+
+    # запускаем фоновый поток как демон
+    t = threading.Thread(target=hourly_loop_daemon, daemon=True)
+    t.start()
+    logger.info("Запущен фоновый поток для hourly_loop_daemon")
+
+    # и затем запускаем polling
+    app.run_polling(stop_signals=None)
 
 # Внутри main(), перед app.run_polling():
     # запускаем фоновый поток как демон
