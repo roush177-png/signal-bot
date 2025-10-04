@@ -1,5 +1,5 @@
 python-telegram-bot==21.6
 requests
 python-telegram-bot[job-queue]==21.6
-ccxt==4.4.66
+ccxt
 pytz==2024.1
