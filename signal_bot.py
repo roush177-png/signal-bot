@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Oblivion Signal Bot — автоматический мониторинг и сигналы на основе структуры.
+Улучшенная версия с фильтрами объема и времени входа.
 
 Требуется:
     pip install python-telegram-bot==21.6 ccxt==4.4.66 pytz==2024.1
@@ -64,8 +65,12 @@ VOL_WINDOW = 20
 VOL_ANOMALY = 1.5
 
 # Реал-тайм: M15 вместо M5
-REALTIME_TF = "15m"  
+REALTIME_TF = "15m"
 REALTIME_CHECK_INTERVAL = 900  # секунды, проверка каждые 15 мин
+
+# НОВЫЕ НАСТРОЙКИ ФИЛЬТРОВ
+MIN_VOLUME_RATIO = 0.5     # минимальный порог объема
+MAX_ENTRY_SLIPPAGE_ATR = 0.3  # максимальное отклонение от точки входа в ATR
 
 exchange = ccxt.bybit({"enableRateLimit": True})
 NEXT_PULSE_AT = None  # для /pulse
@@ -280,6 +285,50 @@ def entry_in_zone(entry_price: float, zone):
     top, bot = zone
     return bot <= entry_price <= top
 
+# -------------------- (NEW) УЛУЧШЕННЫЙ ТРЕНДОВЫЙ АНАЛИЗ --------------------
+
+def reliable_trend_analysis(symbol_bot: str, lookback: int = 50):
+    """
+    Упрощенный и надежный анализ тренда вместо сложного волнового анализа
+    """
+    try:
+        cs = fetch_last_n_h1_candles(symbol_bot, lookback)
+        if len(cs) < lookback:
+            return {"trend": "neutral", "confidence": 0, "error": "insufficient_data"}
+        
+        highs = [c["high"] for c in cs]
+        lows = [c["low"] for c in cs]
+        closes = [c["close"] for c in cs]
+        
+        # Простой тренд по SMA
+        sma_fast = sum(closes[-10:]) / min(10, len(closes))
+        sma_slow = sum(closes[-20:]) / min(20, len(closes))
+        
+        trend = "up" if sma_fast > sma_slow else "down"
+        confidence = min(abs(sma_fast - sma_slow) / (sma_slow + 0.001), 1.0)
+        
+        # Определяем силу тренда
+        if confidence > 0.7:
+            strength = "strong"
+        elif confidence > 0.3:
+            strength = "medium"
+        else:
+            strength = "weak"
+        
+        return {
+            "trend": trend,
+            "confidence": round(confidence, 2),
+            "strength": strength,
+            "sma_fast": sma_fast,
+            "sma_slow": sma_slow,
+            "support": min(lows[-5:]),
+            "resistance": max(highs[-5:]),
+            "pattern": f"{trend}_{strength}",
+            "notes": f"SMA {trend} ({strength})"
+        }
+    except Exception as e:
+        return {"trend": "error", "confidence": 0, "error": str(e)}
+
 # -------------------- (3) PARTIAL TP/SL --------------------
 
 def parse_partial_scheme(s: str = PARTIAL_SCHEME):
@@ -320,20 +369,20 @@ def check_tp_hits_and_messages(symbol: str, direction: str, signal: dict, candle
         return (hi >= tp) if direction == "long" else (lo <= tp)
 
     if len(tp_list) >= 1 and not prog.get("TP1", False) and hit(tp_list[0]):
-        msgs.append(f"{symbol} [{direction.upper()}] TP1 hit ({tp_list[0]:.6f}) → close {parts[0]}% | move SL → {be_level_fmt} (BE)")
+        msgs.append(f"🎯 {symbol} [{direction.upper()}] TP1 достигнут ({tp_list[0]:.6f}) → закрыть {parts[0]}% | SL → {be_level_fmt} (BE)")
         prog["TP1"] = True
         if not prog.get("BE", False): prog["BE"] = True
         changed = True
 
     if len(tp_list) >= 2 and not prog.get("TP2", False) and hit(tp_list[1]):
         close_pct = parts[1] if len(parts) > 1 else 0
-        msgs.append(f"{symbol} [{direction.upper()}] TP2 hit ({tp_list[1]:.6f}) → close {close_pct}% | keep tail")
+        msgs.append(f"🎯 {symbol} [{direction.upper()}] TP2 достигнут ({tp_list[1]:.6f}) → закрыть {close_pct}% | оставить хвост")
         prog["TP2"] = True
         changed = True
 
     if len(tp_list) >= 3 and not prog.get("TP3", False) and hit(tp_list[2]):
         close_pct = parts[2] if len(parts) > 2 else 0
-        msgs.append(f"{symbol} [{direction.upper()}] TP3 hit ({tp_list[2]:.6f}) → close {close_pct}% | trade complete ✅")
+        msgs.append(f"✅ {symbol} [{direction.upper()}] TP3 достигнут ({tp_list[2]:.6f}) → закрыть {close_pct}% | сделка завершена")
         prog["TP3"] = True
         changed = True
 
@@ -372,11 +421,11 @@ def volume_anomaly(symbol_bot: str, window=VOL_WINDOW, last_candle: dict | None 
 
 def risk_line_for(direction: str, btc_dir: str):
     if btc_dir == "flat":
-        return "BTC: neutral → STATUS: OK"
+        return "📊 BTC: нейтральный → СТАТУС: OK"
     if direction == "long":
-        return "BTC: " + ("with trend → STATUS: OK" if btc_dir == "up" else "against trend → STATUS: CAUTION")
+        return "📊 BTC: " + ("по тренду → СТАТУС: OK ✅" if btc_dir == "up" else "против тренда → СТАТУС: ОСТОРОЖНО ⚠️")
     else:
-        return "BTC: " + ("with trend → STATUS: OK" if btc_dir == "down" else "against trend → STATUS: CAUTION")
+        return "📊 BTC: " + ("по тренду → СТАТУС: OK ✅" if btc_dir == "down" else "против тренда → СТАТУС: ОСТОРОЖНО ⚠️")
 
 # -------------------- PDH/PDL + РЕЖИМ --------------------
 
@@ -460,46 +509,62 @@ def generate_signal(symbol: str, candle: dict, levels: dict, level_tf: str, tf: 
         log(f"generate_signal ERR {symbol}: {e}")
         return None
 
+    # 🔴 НОВЫЙ ФИЛЬТР: Проверка объема
+    if rvol_ratio < MIN_VOLUME_RATIO:
+        log(f"❌ Volume filter: {symbol} rvol_ratio={rvol_ratio:.2f} < {MIN_VOLUME_RATIO} - SKIP")
+        return None
+
     direction = None
     entry = None
     sl = None
     tp = []
     confirm_thr = None
 
+    # Динамический буфер на основе волатильности
+    vol_factor = rvol_ratio
+    buffer_k = BUFFER_ATR_K * (0.8 if vol_factor < 1 else 1.2)
+
     if regime == "UP" or regime == "SWEEP_LONG":
         direction = "long"
-        entry = pdl + (a * BUFFER_ATR_K / 2)  # entry на retest PDL с буфером
+        entry = pdl + (a * buffer_k / 2)
         swing_low = min([c["low"] for c in cs[-5:]])
-        sl = swing_low - (a * BUFFER_ATR_K)  # за недавний swing low с буфером
-        # Проверка: SL должен быть ниже entry для лонга
+        sl = swing_low - (a * buffer_k)
         if sl >= entry:
-            sl = entry - (a * BUFFER_ATR_K)  # Используем entry - буфер как запасной вариант
-        confirm_thr = entry  # confirm above entry
+            sl = entry - (a * buffer_k)
+        confirm_thr = entry
         risk = abs(entry - sl)
         tp = [entry + (risk * r) for r in RR_TP]
-        # Фильтр запоздалости для лонга
-        if close > entry * 1.005:  # Цена > entry на 0.5%
-            log(f"Signal {symbol} skipped: close={close} too far from entry={entry} (long)")
+        # Адаптивный фильтр запоздалости
+        delay_threshold = 1 + (a * 0.1)
+        if close > entry * delay_threshold:
+            log(f"Signal {symbol} skipped: close={close} too far from entry={entry} (long, threshold={delay_threshold:.4f})")
             return None
     elif regime == "DOWN" or regime == "SWEEP_SHORT":
         direction = "short"
-        entry = pdh - (a * BUFFER_ATR_K / 2)  # entry на retest PDH с буфером
+        entry = pdh - (a * buffer_k / 2)
         swing_high = max([c["high"] for c in cs[-5:]])
-        sl = swing_high + (a * BUFFER_ATR_K)  # за недавний swing high с буфером
-        # Проверка: SL должен быть выше entry для шорта
+        sl = swing_high + (a * buffer_k)
         if sl <= entry:
-            sl = entry + (a * BUFFER_ATR_K)  # Используем entry + буфер как запасной вариант
-        confirm_thr = entry  # confirm below entry
+            sl = entry + (a * buffer_k)
+        confirm_thr = entry
         risk = abs(sl - entry)
         tp = [entry - (risk * r) for r in RR_TP]
-        # Фильтр запоздалости для шорта
-        if close < entry * 0.995:  # Цена < entry на 0.5%
-            log(f"Signal {symbol} skipped: close={close} too far from entry={entry} (short)")
+        # Адаптивный фильтр запоздалости
+        delay_threshold = 1 + (a * 0.1)
+        if close < entry / delay_threshold:
+            log(f"Signal {symbol} skipped: close={close} too far from entry={entry} (short, threshold={delay_threshold:.4f})")
+            return None
+
+    # 🔴 НОВЫЙ ФИЛЬТР: Проверка дистанции входа
+    if a > 0:  # избегаем деления на ноль
+        price_deviation = abs(candle['close'] - entry) / a
+        if price_deviation > MAX_ENTRY_SLIPPAGE_ATR:
+            log(f"❌ Entry timing: {symbol} deviation={price_deviation:.2f}ATR > {MAX_ENTRY_SLIPPAGE_ATR} - SKIP")
             return None
 
     # Логирование для отладки
     if direction:
-        log(f"Signal {symbol}: regime={regime}, entry={entry}, sl={sl}, tp={tp}, pdl={pdl}, pdh={pdh}, swing_low={min([c['low'] for c in cs[-5:]])}")
+        log(f"Signal {symbol}: regime={regime}, entry={entry}, sl={sl}, tp={tp}, pdl={pdl}, pdh={pdh}")
 
     if direction is None:
         return None
@@ -515,7 +580,14 @@ def generate_signal(symbol: str, candle: dict, levels: dict, level_tf: str, tf: 
     if sweep_block:
         return None
 
-    return {
+    # --- УЛУЧШЕННЫЙ ТРЕНДОВЫЙ АНАЛИЗ ---
+    try:
+        trend_analysis = reliable_trend_analysis(symbol, lookback=50)
+    except Exception as e:
+        log(f"trend analysis err {symbol}: {e}")
+        trend_analysis = {"trend": "error", "confidence": 0, "error": str(e)}
+
+    result = {
         "direction": direction,
         "entry": entry,
         "SL": sl,
@@ -527,17 +599,20 @@ def generate_signal(symbol: str, candle: dict, levels: dict, level_tf: str, tf: 
         "rvol_tag": rvol_tag,
         "level_tf": level_tf,
         "tp_progress": {"TP1": False, "TP2": False, "TP3": False, "BE": False},
-        "early_confirmed": False if tf != "1h" else True
+        "early_confirmed": False if tf != "1h" else True,
+        "trend_analysis": trend_analysis  # заменили elliott на trend_analysis
     }
+
+    return result
 
 def check_confirmation(direction: str, signal: dict, close_price: float):
     thr = signal.get("confirm_thr")
     if direction == "short":
         if thr is not None and close_price <= thr:
-            return True, "Confirm short (C)", f"close {close_price:.4f} ≤ {thr}"
+            return True, "Подтверждение SHORT ✅", f"цена {close_price:.4f} ≤ {thr:.4f}"
     else:
         if thr is not None and close_price >= thr:
-            return True, "Confirm long (C)", f"close {close_price:.4f} ≥ {thr}"
+            return True, "Подтверждение LONG ✅", f"цена {close_price:.4f} ≥ {thr:.4f}"
     return False, None, None
 
 # -------------------- ПУЛЬС JOBQUEUE --------------------
@@ -593,11 +668,20 @@ async def hourly_pulse_job(context: ContextTypes.DEFAULT_TYPE):
             ok, label, reason = check_confirmation(direction, signal, c["close"])
 
             if ok:
-                line = f"\n⚡️ {sym} [{direction.upper()}] ({level_tf.upper()} levels): {label} — {reason}\n"
-                line += f"entry={signal['entry']:.6f} SL={signal['SL']:.6f} TP={','.join(f'{t:.6f}' for t in signal['TP'])}\n"
+                # 🟢 УЛУЧШЕННЫЙ ФОРМАТ СООБЩЕНИЙ
+                line = f"\n⚡️ {sym} [{direction.upper()}] ({level_tf.upper()} уровни)\n"
+                line += f"🎯 {label} — {reason}\n"
+                line += f"📍 Вход: {signal['entry']:.6f} | SL: {signal['SL']:.6f}\n"
+                line += f"🎯 Тейки: {', '.join(f'{t:.6f}' for t in signal['TP'])}\n"
                 line += risk_line_for(direction, btc_dir_str) + "\n"
-                line += f"VOL: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
-                line += f"context: regime={signal['regime']} ATR={signal['atr']:.4f}\n"
+                line += f"📈 Объем: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
+                line += f"📊 Контекст: режим={signal['regime']} ATR={signal['atr']:.4f}\n"
+                
+                # Улучшенная информация о тренде
+                trend_info = signal.get("trend_analysis", {})
+                if trend_info.get("trend") != "error":
+                    line += f"📈 Тренд: {trend_info.get('trend', 'unknown').upper()} ({trend_info.get('strength', 'unknown')}) | Уверенность: {trend_info.get('confidence', 0)*100:.0f}%\n"
+                
                 parts.append(line)
 
             msgs, changed = check_tp_hits_and_messages(sym, direction, signal, c)
@@ -658,11 +742,20 @@ async def realtime_monitor_job(context: ContextTypes.DEFAULT_TYPE):
             ok, label, reason = check_confirmation(direction, signal, c["close"])
 
             if ok:
-                line = f"\n🚨 EARLY {sym} [{direction.upper()}] ({level_tf.upper()} levels): {label} — {reason} (на {REALTIME_TF.upper()})\n"
-                line += f"entry={signal['entry']:.6f} SL={signal['SL']:.6f} TP={','.join(f'{t:.6f}' for t in signal['TP'])}\n"
+                # 🟢 УЛУЧШЕННЫЙ ФОРМАТ ДЛЯ РЕАЛ-ТАЙМ СИГНАЛОВ
+                line = f"\n🚨 РАННИЙ СИГНАЛ {sym} [{direction.upper()}] ({level_tf.upper()})\n"
+                line += f"🎯 {label} — {reason} (на {REALTIME_TF.upper()})\n"
+                line += f"📍 Вход: {signal['entry']:.6f} | SL: {signal['SL']:.6f}\n"
+                line += f"🎯 Тейки: {', '.join(f'{t:.6f}' for t in signal['TP'])}\n"
                 line += risk_line_for(direction, btc_dir_str) + "\n"
-                line += f"VOL: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
-                line += f"context: regime={signal['regime']} ATR={signal['atr']:.4f} TF={REALTIME_TF.upper()}\n"
+                line += f"📈 Объем: {signal['rvol_ratio']:.2f}×avg → {signal['rvol_tag']}\n"
+                line += f"📊 Контекст: режим={signal['regime']} ATR={signal['atr']:.4f} TF={REALTIME_TF.upper()}\n"
+                
+                # Информация о тренде
+                trend_info = signal.get("trend_analysis", {})
+                if trend_info.get("trend") != "error":
+                    line += f"📈 Тренд: {trend_info.get('trend', 'unknown').upper()} | Уверенность: {trend_info.get('confidence', 0)*100:.0f}%\n"
+                
                 parts.append(line)
                 signal["early_confirmed"] = True  # mark as sent
 
